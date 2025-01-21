@@ -267,6 +267,7 @@ class Transformer(ModelBase, LoRALoaderMixin):
         device: Union[torch.device, str] = "cuda",
         dtype: Optional[torch.dtype] = None,
         softmax_fp32: bool = True,
+        quant_4bit: bool = True,
     ) -> "Transformer":
         with open(Path(folder) / "params.json", "r") as f:
             model_args = TransformerArgs.from_dict(json.load(f))
