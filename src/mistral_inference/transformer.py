@@ -17,6 +17,8 @@ from mistral_inference.rope import precompute_freqs_cis
 from mistral_inference.transformer_layers import RMSNorm, TransformerBlock
 from mistral_inference.vision_encoder import VisionLanguageAdapter, VisionTransformer
 
+from bitsandbytes.functional import quantize_4bit
+
 
 @dataclass
 class SimpleInputMetadata:
@@ -298,7 +300,25 @@ class Transformer(ModelBase, LoRALoaderMixin):
             loaded = torch.load(str(pt_model_file), mmap=True)
         else:
             loaded = safetensors.torch.load_file(str(safetensors_model_file))
+            
+        if quant_4bit:
+            quantized_loaded = {}
+            for name, tensor in loaded.items():
+                # Only quantize linear layer weights
+                if any(k in name for k in ["wq", "wk", "wv", "wo", "w1", "w2", "w3"]):
+                    # Quantize and add quantization state
+                    quant_tensor, quant_state = quantize_4bit(
+                        tensor.to(device=device, dtype=dtype),
+                        quant_type="nf4",
+                        compress_statistics=True
+                    )
+                    quantized_loaded[name] = quant_tensor
+                    quantized_loaded[f"{name}_quant_state"] = quant_state
+                else:
+                    # Copy other tensors as-is
+                    quantized_loaded[name] = tensor.to(device=device, dtype=dtype)
+        loaded = quantized_loaded
 
-        model.load_state_dict(loaded, assign=True, strict=True)
+        model.load_state_dict(loaded, assign=True, strict=False)
 
         return model.to(device=device, dtype=dtype)

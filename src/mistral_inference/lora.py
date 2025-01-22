@@ -8,6 +8,8 @@ import torch
 import torch.nn as nn
 from simple_parsing.helpers import Serializable
 
+from bitsandbytes import nn as bnb
+
 
 @dataclass
 class LoraArgs(Serializable):
@@ -30,6 +32,9 @@ class LoRALinear(nn.Module):
           connection versus original frozen weight. General guidance is
           to keep it to 2.0 and sweep over learning rate when changing
           the rank.
+    
+    EDITS:
+        - adding compatability with bitsandbytes
     """
 
     def __init__(
@@ -38,6 +43,8 @@ class LoRALinear(nn.Module):
         out_features: int,
         rank: int,
         scaling: float,
+        compute_dtype: torch.dtype = torch.float16,  # <-- New arg
+        quant_type: str = "nf4",  # <-- New arg
         bias: bool = False,
     ):
         super().__init__()
@@ -59,8 +66,15 @@ class LoRALinear(nn.Module):
             self.out_features,
             bias=self.bias,
         )
-
-        self.linear = nn.Linear(self.in_features, self.out_features, bias=self.bias)
+        
+        self.linear = bnb.Linear4bit(
+            input_features=self.in_features, 
+            output_features=self.out_features, 
+            bias=self.bias,
+            compute_dtype=compute_dtype,
+            quant_type=quant_type
+            )
+        self.linear.weight.requires_grad = False
 
         # make sure no LoRA weights are marked as "missing" in load_state_dict
         def ignore_missing_keys(m: nn.Module, incompatible_keys: NamedTuple) -> None:
@@ -69,9 +83,9 @@ class LoRALinear(nn.Module):
         self.register_load_state_dict_post_hook(ignore_missing_keys)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        lora = self.lora_B(self.lora_A(x))
-        result: torch.Tensor = self.linear(x) + lora * self.scaling
-        return result
+        lora = self.lora_B(self.lora_A(x)) * self.scaling
+        base = self.linear(x)
+        return lora + base
 
     def _load_from_state_dict(self, state_dict: Dict[str, Any], prefix: str, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
         key_name = prefix + "weight"
