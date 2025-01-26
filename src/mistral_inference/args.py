@@ -30,8 +30,7 @@ class TransformerArgs(Serializable):
     n_kv_heads: int
     norm_eps: float
     vocab_size: int
-
-    max_batch_size: int = 0
+    max_batch_size: int
 
     # For rotary embeddings. If not set, will be inferred
     rope_theta: Optional[float] = None

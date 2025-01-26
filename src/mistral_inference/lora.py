@@ -8,6 +8,10 @@ import torch
 import torch.nn as nn
 from simple_parsing.helpers import Serializable
 
+# for quantizing
+from mistral_inference.hqq import _HQQ
+from hqq.core.quantize import HQQLinear
+
 
 @dataclass
 class LoraArgs(Serializable):
@@ -38,6 +42,7 @@ class LoRALinear(nn.Module):
         out_features: int,
         rank: int,
         scaling: float,
+        quant_config: dict,
         bias: bool = False,
     ):
         super().__init__()
@@ -48,19 +53,25 @@ class LoRALinear(nn.Module):
         self.bias = bias
         self.rank = rank
         self.scaling = scaling
+        self._hqq = _HQQ(quant_config)
 
         self.lora_A = nn.Linear(
             self.in_features,
             self.rank,
             bias=self.bias,
         )
+        
         self.lora_B = nn.Linear(
             self.rank,
             self.out_features,
             bias=self.bias,
         )
 
-        self.linear = nn.Linear(self.in_features, self.out_features, bias=self.bias)
+        self.linear = self._hqq.linear(
+            self.in_features, 
+            self.out_features, 
+            bias=self.bias, 
+        )
 
         # make sure no LoRA weights are marked as "missing" in load_state_dict
         def ignore_missing_keys(m: nn.Module, incompatible_keys: NamedTuple) -> None:
@@ -121,7 +132,7 @@ class LoRALoaderMixin:
             # replace every nn.Linear with a LoRALinear with 'meta' device except the output layer
             named_modules = dict(self.named_modules())  # type: ignore[attr-defined]
             for name, module in named_modules.items():
-                if isinstance(module, nn.Linear) and name != "output":
+                if (isinstance(module, nn.Linear) or isinstance(module, HQQLinear)) and name != "output":
                     layer_id = name.split(".")[1]
                     if layer_id not in self.layers:  # type: ignore[attr-defined]
                         logging.debug(

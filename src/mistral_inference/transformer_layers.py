@@ -13,20 +13,12 @@ from mistral_inference.moe import MoeArgs, MoeLayer
 from mistral_inference.rope import apply_rotary_emb
 
 
+from mistral_inference.hqq import _HQQ
+
 def repeat_kv(keys: torch.Tensor, values: torch.Tensor, repeats: int, dim: int) -> Tuple[torch.Tensor, torch.Tensor]:
     keys = torch.repeat_interleave(keys, repeats=repeats, dim=dim)
     values = torch.repeat_interleave(values, repeats=repeats, dim=dim)
     return keys, values
-
-
-def maybe_lora(
-    lora_args: Optional[LoraArgs],
-) -> Union[Type[nn.Linear], partial[LoRALinear]]:
-    if lora_args is None:
-        return nn.Linear
-    else:
-        return partial(LoRALinear, rank=lora_args.rank, scaling=lora_args.scaling)
-
 
 class Attention(nn.Module):
     def __init__(
@@ -35,6 +27,7 @@ class Attention(nn.Module):
         n_heads: int,
         head_dim: int,
         n_kv_heads: int,
+        quant_config: dict,
         lora: Optional[LoraArgs] = None,
     ):
         super().__init__()
@@ -46,13 +39,21 @@ class Attention(nn.Module):
         self.repeats = self.n_heads // self.n_kv_heads
 
         self.scale = self.head_dim**-0.5
-
-        MaybeLora = maybe_lora(lora)
-        self.wq = MaybeLora(dim, n_heads * head_dim, bias=False)
-        self.wk = MaybeLora(dim, n_kv_heads * head_dim, bias=False)
-        self.wv = MaybeLora(dim, n_kv_heads * head_dim, bias=False)
-        self.wo = MaybeLora(n_heads * head_dim, dim, bias=False)
-
+        self._hqq = _HQQ(quant_config)
+        
+        if lora is None:
+            self.wq = self._hqq.linear(dim, n_heads * head_dim, bias=False)
+            self.wk = self._hqq.linear(dim, n_kv_heads * head_dim, bias=False)
+            self.wv = self._hqq.linear(dim, n_kv_heads * head_dim, bias=False)
+            self.wo = self._hqq.linear(n_heads * head_dim, dim, bias=False)
+        else:
+            self.wq = LoRALinear(dim, n_heads * head_dim, bias=False, rank=lora.rank, scaling=lora.scaling)
+            self.wk = LoRALinear(dim, n_kv_heads * head_dim, bias=False, rank=lora.rank, scaling=lora.scaling)
+            self.wv = LoRALinear(dim, n_kv_heads * head_dim, bias=False, rank=lora.rank, scaling=lora.scaling)
+            self.wo = LoRALinear(n_heads * head_dim, dim, bias=False, rank=lora.rank, scaling=lora.scaling)
+            
+        
+        
     def forward(
         self,
         x: torch.Tensor,
@@ -94,13 +95,19 @@ class Attention(nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int, lora: Optional[LoraArgs] = None):
+    def __init__(self, dim: int, hidden_dim: int, quant_config: any, lora: Optional[LoraArgs] = None):
         super().__init__()
+        
+        self._hqq = _HQQ(quant_config)
 
-        MaybeLora = maybe_lora(lora)
-        self.w1 = MaybeLora(dim, hidden_dim, bias=False)
-        self.w2 = MaybeLora(hidden_dim, dim, bias=False)
-        self.w3 = MaybeLora(dim, hidden_dim, bias=False)
+        if lora is None:
+            self.w1 = nn.Linear(dim, hidden_dim, bias=False)
+            self.w2 = nn.Linear(hidden_dim, dim, bias=False)
+            self.w3 = nn.Linear(dim, hidden_dim, bias=False)
+        else:
+            self.w1 = self._hqq.linear(dim, hidden_dim, bias=False)
+            self.w2 = self._hqq.linear(hidden_dim, dim, bias=False)
+            self.w3 = self._hqq.linear(dim, hidden_dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.w2(nn.functional.silu(self.w1(x)) * self.w3(x))  # type: ignore
@@ -129,6 +136,7 @@ class TransformerBlock(nn.Module):
         n_kv_heads: int,
         head_dim: int,
         norm_eps: float,
+        quant_config: dict,
         lora: Optional[LoraArgs] = None,
         moe: Optional[MoeArgs] = None,
     ):
@@ -141,6 +149,7 @@ class TransformerBlock(nn.Module):
             head_dim=head_dim,
             n_kv_heads=n_kv_heads,
             lora=lora,
+            quant_config=quant_config
         )
         self.attention_norm = RMSNorm(dim, eps=norm_eps)
         self.ffn_norm = RMSNorm(dim, eps=norm_eps)
@@ -153,7 +162,9 @@ class TransformerBlock(nn.Module):
                 moe_args=moe,
             )
         else:
-            self.feed_forward = FeedForward(dim=dim, hidden_dim=hidden_dim, lora=lora)
+            self.feed_forward = FeedForward(dim=dim, hidden_dim=hidden_dim, lora=lora, quant_config=quant_config)
+            
+        self._hqq = _HQQ(quant_config)
 
     def forward(
         self,
